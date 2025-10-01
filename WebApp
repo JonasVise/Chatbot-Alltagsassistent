@@ -1,3 +1,4 @@
+# --- BENÖTIGTE BIBLIOTHEKEN IMPORTIEREN ---
 import streamlit as st
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -7,6 +8,7 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import AIMessage, HumanMessage
 from streamlit_local_storage import LocalStorage
+from streamlit_mic_recorder import mic_recorder
 import langchain
 from gtts import gTTS
 import base64
@@ -14,94 +16,148 @@ import io
 import os
 import re
 
-# --- Streamlit Seitenkonfiguration ---
+# --- DEBUG-MODUS FÜR LANGCHAIN ---
+# Aktiviert ausführliche Log-Ausgaben von LangChain, was bei der Fehlersuche hilft.
+langchain.debug = True
+
+
+# --- STREAMLIT SEITENKONFIGURATION ---
+# Richtet die grundlegenden Einstellungen der Webseite ein, wie den Titel im Browser-Tab und das Layout.
 st.set_page_config(page_title="Alltags-Assistent", page_icon="🤖", layout="wide")
 
-# --- Initialisierung des Browser-Speichers ---
+# --- INITIALISIERUNG DES BROWSER-SPEICHERS ---
+# Erstellt ein Objekt, um Daten im Local Storage des Webbrowsers zu speichern und zu laden.
 localS = LocalStorage()
 
-# --- Funktionen zum Laden von Dateien ---
+# --- FUNKTIONEN ZUM LADEN VON DATEIEN ---
+# Die Annotation @st.cache_data sorgt dafür, dass Streamlit das Ergebnis dieser Funktion zwischenspeichert.
+# Die Funktion wird nur dann erneut ausgeführt, wenn sich der Dateipfad ändert. Das spart Ladezeit.
 @st.cache_data
 def get_file_content(filepath):
+    # Versucht, eine Textdatei zu öffnen, ihren Inhalt zu lesen und zurückzugeben.
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             return f.read()
+    # Falls die Datei nicht gefunden wird, wird None zurückgegeben.
     except FileNotFoundError:
         return None
 
+# Diese Funktion wird ebenfalls zwischengespeichert, um die Performance zu verbessern.
 @st.cache_data
 def load_checklist_items(filepath):
+    # Versucht, eine Datei zu öffnen und jede Zeile als einzelnen Eintrag in einer Liste zu speichern.
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
+            # Leere Zeilen oder Zeilen mit nur Leerzeichen werden ignoriert.
             return [line.strip() for line in f if line.strip()]
+    # Falls die Datei nicht gefunden wird, wird eine leere Liste zurückgegeben.
     except FileNotFoundError:
         return []
 
-# --- TTS & LangChain-Setup ---
+# --- TTS & LANGCHAIN-SETUP ---
+# Funktion zur Umwandlung von Text in gesprochene Audio-Daten.
 def text_to_audio_base64(text):
     try:
+        # Erstellt ein gTTS-Objekt für deutschen Text.
         tts = gTTS(text=text, lang='de')
+        # Erstellt ein "virtuelles" Dateiobjekt im Arbeitsspeicher.
         audio_fp = io.BytesIO()
+        # Schreibt die generierten Audiodaten in das virtuelle Objekt.
         tts.write_to_fp(audio_fp)
+        # Setzt den Lesezeiger an den Anfang der virtuellen Datei.
         audio_fp.seek(0)
+        # Gibt die rohen Audiodaten zurück.
         return audio_fp.getvalue()
+    # Fängt mögliche Fehler bei der Audioerstellung ab und zeigt eine Fehlermeldung an.
     except Exception as e:
         st.error(f"Fehler bei der Audio-Erstellung: {e}")
         return None
 
+# @st.cache_resource wird für Dinge verwendet, die teuer in der Erstellung sind (z.B. Modelle laden, DB-Verbindungen).
+# Das Ergebnis wird zwischengespeichert und über verschiedene Sitzungen hinweg wiederverwendet.
 @st.cache_resource
 def setup_intelligent_chain():
+    # Initialisiert das Sprachmodell (LLM), das über Ollama auf einem lokalen Server läuft.
     llm = OllamaLLM(model="gpt-oss:20B", base_url="http://127.0.0.1:11434")
+    # Lädt das Embedding-Modell von HuggingFace, das auf der CPU laufen soll.
     embedding = HuggingFaceEmbeddings(model_name="Qwen/Qwen3-Embedding-4B", model_kwargs={"device": "cpu"})
+    # Verbindet sich mit der lokalen Chroma Vektor-Datenbank, die die Embeddings enthält.
     db = Chroma(persist_directory="./chroma_db_kombiniert3", embedding_function=embedding)
+    # Erstellt einen "Retriever", der die 5 relevantesten Dokumente aus der Datenbank abrufen kann.
     retriever = db.as_retriever(search_kwargs={'k': 5})
+    # Gibt das initialisierte Modell und den Retriever zurück.
     return llm, retriever
 
+# Ruft die Setup-Funktion auf und speichert die Ergebnisse in globalen Variablen.
 llm, retriever = setup_intelligent_chain()
 
+# Hauptfunktion, die eine Anfrage verarbeitet und eine kontextbezogene Antwort generiert.
 def get_conversational_response(frage, chat_history, language_preference, user_context):
+    # System-Anweisung für das LLM, um eine Folgefrage basierend auf dem Chatverlauf und Benutzerfakten umzuformulieren.
+    # Ziel ist es, eine eigenständige Frage zu erstellen, die ohne den vorherigen Kontext verständlich ist.
     contextualize_q_system_prompt = """Gegeben ist ein Chat-Verlauf, eine Sammlung von Fakten über den Benutzer ({user_context}) und eine neue Frage.
 Formuliere basierend auf dem Chat-Verlauf UND den Fakten eine eigenständige Frage, die ohne den restlichen Chat-Verlauf verständlich ist.
 Antworte NICHT auf die Frage, sondern formuliere sie nur neu. Wenn die Frage bereits eigenständig ist und keinen Kontext benötigt, gib sie unverändert zurück."""
 
+    # Erstellt eine Prompt-Vorlage, die die System-Anweisung, den Chat-Verlauf und die neue Benutzereingabe kombiniert.
     contextualize_q_prompt = ChatPromptTemplate.from_messages(
         [
             ("system", contextualize_q_system_prompt),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
+            MessagesPlaceholder("chat_history"), # Platzhalter für den bisherigen Chatverlauf
+            ("human", "{input}"), # Platzhalter für die aktuelle Frage des Nutzers
         ]
     )
+    # Erstellt einen "history-aware retriever", der zuerst die Frage umformuliert und dann relevante Dokumente sucht.
     history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
     
+    # Definiert zwei verschiedene System-Anweisungen für die endgültige Antwortgenerierung.
     simple_prompt = "Du bist ein freundlicher Alltags-Assistent für junge Menschen mit Lernschwierigkeiten. Antworte IMMER in **sehr einfacher Sprache**. Benutze kurze Sätze. Antworte auf die Frage des Nutzers basierend auf dem folgenden Kontext:\n\nKONTEXT:\n{context}"
     standard_prompt = "Du bist ein freundlicher und hilfreicher Alltags-Assistent. Antworte auf die Frage des Nutzers basierend auf dem folgenden Kontext:\n\nKONTEXT:\n{context}"
     
+    # Erstellt die endgültige Prompt-Vorlage für die Frage-Antwort-Kette.
+    # Wählt die Anweisung basierend auf der vom Benutzer gewählten Spracheinstellung ('simple' oder 'standard').
     qa_prompt = ChatPromptTemplate.from_messages(
         [("system", simple_prompt if language_preference == 'simple' else standard_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
     )
     
+    # Erstellt eine Kette, die die abgerufenen Dokumente (den Kontext) in die Prompt-Vorlage einfügt ("stuffing").
     question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    # Kombiniert den Retriever und die Frage-Antwort-Kette zu einer vollständigen RAG (Retrieval-Augmented Generation) Kette.
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
     
+    # Zeigt eine Ladeanimation an, während das Modell die Antwort generiert.
     with st.spinner("Ich denke nach..."):
+        # Führt die gesamte Kette aus und gibt nur den Text der Antwort zurück.
         return rag_chain.invoke({"input": frage, "chat_history": chat_history, "user_context": user_context})['answer']
 
-# --- Session State Initialisierung ---
+# --- SESSION STATE INITIALISIERUNG ---
+# Der "Session State" ist der Speicher für eine einzelne Benutzersitzung. Er merkt sich Werte, solange der Browser-Tab offen ist.
+# Wenn der Chat-Verlauf ("messages") noch nicht existiert, wird er als leere Liste initialisiert.
 if "messages" not in st.session_state:
     st.session_state.messages = []
+# Initialisiert die Spracheinstellung, falls noch nicht vorhanden.
 if "language_preference" not in st.session_state:
     st.session_state.language_preference = None
+# Initialisiert den Zustand der Checklisten. Versucht zuerst, ihn aus dem Browser-Speicher zu laden.
 if "checklist_states" not in st.session_state:
     st.session_state.checklist_states = localS.getItem("all_checklists") or {}
+# Initialisiert eine Variable, die steuert, ob der "Ablaufplan"-Button angezeigt wird.
 if "show_ablaufplan_button" not in st.session_state:
     st.session_state.show_ablaufplan_button = False
+# Initialisiert die Liste der freigeschalteten Checklisten. Lädt sie aus dem Browser-Speicher.
 if "unlocked_checklists" not in st.session_state:
     st.session_state.unlocked_checklists = localS.getItem("unlocked_checklists") or []
+# Initialisiert den Zustand der Konversation, z.B. um auf eine spezifische Antwort zu warten.
 if "conversation_state" not in st.session_state:
     st.session_state.conversation_state = "chat_active"
+# Initialisiert den Benutzerkontext (z.B. Wohnort), der während des Gesprächs gesammelt wird.
 if "context" not in st.session_state:
     st.session_state.context = {}
+# Initialisiert eine Variable für den Text aus der Spracheingabe.
+if "voice_prompt" not in st.session_state:
+    st.session_state.voice_prompt = None
 
+# Hilfsfunktion, um eine neue Nachricht zum Chat-Verlauf im Session State hinzuzufügen.
 def add_message(role, content):
     st.session_state.messages.append({"role": role, "content": content})
 
@@ -109,52 +165,72 @@ def add_message(role, content):
 # --- SEITENLEISTE (Sidebar) mit Navigation und Checklisten ---
 # ======================================================================
 st.sidebar.title("Navigation")
+# Erstellt einen Button in der Seitenleiste, um das Gespräch zurückzusetzen.
 if st.sidebar.button("Neues Gespräch starten 🏠", use_container_width=True):
+    # Setzt alle relevanten Session-State-Variablen auf ihre Anfangswerte zurück.
     st.session_state.messages = []
     st.session_state.language_preference = None
     st.session_state.show_ablaufplan_button = False
     st.session_state.conversation_state = "chat_active"
     st.session_state.context = {}
+    # Lädt die Seite neu, damit die Änderungen wirksam werden.
     st.rerun()
 
+# Erstellt einen Button, der alles zurücksetzt, inklusive der im Browser gespeicherten Daten.
 if st.sidebar.button("Alles zurücksetzen ⚠️", use_container_width=True, help="Löscht den Chat UND die gespeicherten Checklisten."):
-    localS.setItem("unlocked_checklists", [])
-    localS.setItem("all_checklists", {})
-    for key in st.session_state.keys():
+    # Löscht die Daten aus dem Local Storage.
+    localS.setItem("unlocked_checklists", [], key="reset_unlocked_lists")
+    localS.setItem("all_checklists", {}, key="reset_all_checklists")
+    # Löscht alle Schlüssel aus dem Session State, um einen kompletten Neustart zu erzwingen.
+    for key in list(st.session_state.keys()):
         del st.session_state[key]
+    # Lädt die Seite neu.
     st.rerun()
 
-st.sidebar.divider()
+st.sidebar.divider() # Fügt eine Trennlinie in der Seitenleiste hinzu.
 st.sidebar.title("✅ Deine Checklisten")
 
+# Ein Wörterbuch, das den internen IDs der Checklisten benutzerfreundliche Namen zuordnet.
 available_checklists = {"fuehrerschein": "Führerschein 🚗"}
 
-# HINWEIS: Dieser Text wird nur angezeigt, wenn die Liste `unlocked_checklists` leer ist.
+# Wenn noch keine Checklisten freigeschaltet wurden, wird ein Hinweistext angezeigt.
 if not st.session_state.unlocked_checklists:
     st.sidebar.info("Deine persönlichen Checklisten erscheinen hier, sobald du sie im Chat entdeckt hast.")
 
-# HINWEIS: Diese Schleife wird nur durchlaufen, wenn die Liste `unlocked_checklists` Einträge enthält.
-# Die Checkliste erscheint also erst, nachdem sie freigeschaltet wurde.
+# Geht durch alle freigeschalteten Checklisten-IDs.
 for checklist_id in st.session_state.unlocked_checklists:
+    # Holt den Anzeigenamen aus dem Wörterbuch.
     display_name = available_checklists.get(checklist_id, "Unbekannte Checkliste")
+    # Erstellt einen ausklappbaren Bereich (Expander) für jede Checkliste.
     with st.sidebar.expander(display_name, expanded=True):
+        # Lädt die Einträge für die aktuelle Checkliste aus der entsprechenden Textdatei.
         items = load_checklist_items(os.path.join("Ablaufplaene", f"checklist_{checklist_id}.txt"))
         
+        # Wenn Einträge gefunden wurden:
         if items:
+            # Stellt sicher, dass ein Speicherbereich für diese Checkliste im Session State existiert.
             if checklist_id not in st.session_state.checklist_states:
                 st.session_state.checklist_states[checklist_id] = {}
+            # Holt den aktuellen Zustand der Checkboxen für diese Liste.
             current_states = st.session_state.checklist_states[checklist_id]
-            all_checked = True
+            all_checked = True # Variable, um zu prüfen, ob alles abgehakt ist.
+            # Geht jeden Eintrag der Checkliste durch.
             for item in items:
+                # Initialisiert den Zustand des Eintrags als "nicht abgehakt", falls er neu ist.
                 if item not in current_states:
                     current_states[item] = False
+                # Erstellt eine Checkbox. Der `key` muss eindeutig sein, um Fehler zu vermeiden.
                 is_checked = st.checkbox(item, value=current_states.get(item, False), key=f"sidebar_check_{checklist_id}_{item}")
+                # Speichert den neuen Zustand der Checkbox.
                 current_states[item] = is_checked
+                # Wenn auch nur eine Checkbox nicht abgehakt ist, wird die Variable auf False gesetzt.
                 if not is_checked:
                     all_checked = False
+            # Wenn alle Einträge abgehakt sind und die Liste nicht leer war, wird eine Erfolgsmeldung angezeigt.
             if all_checked and items:
                 st.success("Super! Alles erledigt! 🎉")
 
+# Speichert den aktuellen Zustand aller Checklisten und der freigeschalteten Listen im Browser-Speicher.
 localS.setItem("all_checklists", st.session_state.checklist_states, key="storage_checklist_states")
 localS.setItem("unlocked_checklists", st.session_state.unlocked_checklists, key="storage_unlocked_lists")
 
@@ -163,115 +239,170 @@ localS.setItem("unlocked_checklists", st.session_state.unlocked_checklists, key=
 # ======================================================================
 st.title("Dein persönlicher Alltags-Assistent 🤖")
 
-# Startlogik
+# --- STARTLOGIK ---
+# Diese Logik wird nur ausgeführt, wenn der Chat leer ist (also zu Beginn).
 if not st.session_state.messages:
+    # Schritt 1: Wenn die Sprache noch nicht gewählt wurde, frage danach.
     if st.session_state.language_preference is None:
         with st.chat_message("assistant"):
             st.markdown("Hallo! 👋 Bevor wir beginnen: Soll ich dir in **einfacher Sprache** antworten?")
-            cols = st.columns(2)
+            cols = st.columns(2) # Erstellt zwei Spalten für die Buttons.
+            # Button für einfache Sprache
             if cols[0].button("Ja, in einfacher Sprache", use_container_width=True):
                 st.session_state.language_preference = 'simple'
-                st.rerun()
+                st.rerun() # Lädt die Seite neu, um zum nächsten Schritt zu gelangen.
+            # Button für Standardsprache
             if cols[1].button("Nein, danke", use_container_width=True):
                 st.session_state.language_preference = 'standard'
                 st.rerun()
+    # Schritt 2: Wenn die Sprache gewählt wurde, zeige die Themen-Buttons an.
     else:
         with st.chat_message("assistant"):
             st.markdown("Verstanden. Womit kann ich dir helfen?")
-            cols = st.columns(3)
+            cols = st.columns(3) # Erstellt drei Spalten für die Themen.
+            # Button für das Thema "Führerschein"
             if cols[0].button("Führerschein 🚗", use_container_width=True):
                 add_message("user", "Ich interessiere mich für den Führerschein.")
+                # Lädt den Einführungstext aus einer Datei.
                 einfuehrung_text = get_file_content(os.path.join("Einfuehrungstexte", "Einfuehrung_Fuehrerschein.txt"))
                 add_message("assistant", einfuehrung_text or "Text nicht gefunden.")
-                st.session_state.show_ablaufplan_button = True
+                st.session_state.show_ablaufplan_button = True # Aktiviert den Button für den Ablaufplan.
                 st.rerun()
+            # Button für das Thema "Girokonto"
             if cols[1].button("Girokonto 💳", use_container_width=True):
                 add_message("user", "Ich interessiere mich für das Girokonto.")
                 einfuehrung_text = get_file_content(os.path.join("Einfuehrungstexte", "Einfuehrung_Girokonto.txt"))
                 add_message("assistant", einfuehrung_text or "Text nicht gefunden.")
                 st.rerun()
+            # Button für das Thema "Freizeit"
             if cols[2].button("Freizeit ⚽️", use_container_width=True):
                 add_message("user", "Ich interessiere mich für Freizeitaktivitäten.")
                 einfuehrung_text = get_file_content(os.path.join("Einfuehrungstexte", "Einfuehrung_Freizeit.txt"))
                 add_message("assistant", einfuehrung_text or "Text nicht gefunden.")
                 st.rerun()
 
-# Chat-Verlauf anzeigen
+# --- CHAT-VERLAUF ANZEIGEN ---
+# Geht durch alle Nachrichten im Session State und zeigt sie an.
 for i, message in enumerate(st.session_state.messages):
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    with st.chat_message(message["role"]): # Erstellt eine Chat-Blase für "user" oder "assistant".
+        st.markdown(message["content"]) # Zeigt den Inhalt der Nachricht an.
+        # Nur bei Nachrichten des Assistenten wird ein Vorlese-Button hinzugefügt.
         if message["role"] == "assistant":
-            _, col_btn = st.columns([0.95, 0.05])
+            _, col_btn = st.columns([0.95, 0.05]) # Erstellt Spalten, um den Button rechts zu platzieren.
             with col_btn:
+                # Erstellt den Vorlese-Button mit einem eindeutigen Schlüssel.
                 if st.button("🔊", key=f"tts_button_{i}", help="Vorlesen"):
+                    # Wandelt den Nachrichtentext in Audio um.
                     audio_bytes = text_to_audio_base64(message["content"])
+                    # Wenn die Audio-Erstellung erfolgreich war, wird ein Audio-Player angezeigt und automatisch gestartet.
                     if audio_bytes:
                         st.audio(audio_bytes, format="audio/mp3", autoplay=True)
 
-# Button für Ablaufplan
+# --- BUTTON FÜR ABLAUFPLAN ---
+# Zeigt diesen Button nur an, wenn die entsprechende Variable im Session State True ist.
 if st.session_state.get("show_ablaufplan_button", False):
     if st.button("Ablaufplan Führerschein anzeigen", use_container_width=True):
+        # Fügt die Aktionen des Nutzers und des Assistenten zum Chatverlauf hinzu.
         add_message("user", "Zeig mir bitte den Ablaufplan für den Führerschein.")
         ablaufplan_text = get_file_content(os.path.join("Ablaufplaene", "Ablaufplan_Fuehrerschein.txt"))
         if ablaufplan_text:
             add_message("assistant", ablaufplan_text)
+            # Zeigt einen permanenten Hinweis (Info-Box) an.
             st.info("Tipp: Die interaktive Checkliste dazu findest du ab jetzt in der Seitenleiste links! 👈", icon="💡")
             
-            # HINWEIS: DIES IST DER ENTSCHEIDENDE PUNKT!
-            # Nur hier wird die Checkliste "freigeschaltet", indem ihr Name zur Liste hinzugefügt wird.
+            # Schaltet die Führerschein-Checkliste für die Seitenleiste frei, falls noch nicht geschehen.
             if "fuehrerschein" not in st.session_state.unlocked_checklists:
                 st.session_state.unlocked_checklists.append("fuehrerschein")
         else:
             add_message("assistant", "Entschuldigung, den Ablaufplan habe ich nicht gefunden.")
+        # Versteckt den Button nach dem Klick, um doppelte Anzeigen zu vermeiden.
         st.session_state.show_ablaufplan_button = False
         st.rerun()
 
 
-# --- Hauptlogik für den Chat-Input ---
-if prompt := st.chat_input("Stelle eine Frage oder wähle ein Thema..."):
+# --- HAUPTLOGIK FÜR DEN CHAT-INPUT ---
+# Teilt den unteren Bereich in zwei Spalten: eine für das Textfeld, eine für den Mikrofon-Button.
+input_col, mic_col = st.columns([0.9, 0.1])
+
+with input_col:
+    # Erstellt das Texteingabefeld am unteren Rand der Seite.
+    text_prompt = st.chat_input("Stelle eine Frage oder wähle ein Thema...")
+
+with mic_col:
+    st.text("") # Fügt einen kleinen Abstand hinzu, um den Button vertikal zu zentrieren.
+    # Initialisiert die Mikrofon-Recorder-Komponente.
+    voice_recording = mic_recorder(
+        start_prompt="🎤", # Symbol für den Start der Aufnahme
+        stop_prompt="🛑",  # Symbol für das Stoppen der Aufnahme
+        key='recorder',
+        use_container_width=True
+    )
+
+# Wenn eine Sprachaufnahme gemacht und in Text umgewandelt wurde, speichere den Text im Session State.
+if voice_recording and voice_recording.get('text'):
+    st.session_state.voice_prompt = voice_recording['text']
+
+# Entscheidet, welche Eingabe verwendet wird. Die Texteingabe hat Vorrang.
+prompt = text_prompt or st.session_state.voice_prompt
+
+# Wenn eine Eingabe (entweder Text oder Sprache) vorhanden ist, wird dieser Block ausgeführt.
+if prompt:
+    # Setzt die Spracheingabe zurück, damit sie nicht erneut verarbeitet wird.
+    st.session_state.voice_prompt = None
+    
+    # Versteckt den Ablaufplan-Button, da der Nutzer eine neue Frage gestellt hat.
     st.session_state.show_ablaufplan_button = False
+    # Fügt die Nachricht des Nutzers zum Chatverlauf hinzu.
     add_message("user", prompt)
     
+    # Bereitet den Chat-Verlauf für LangChain vor, indem er in das richtige Format (AIMessage, HumanMessage) gebracht wird.
+    # Die letzte Nachricht (die aktuelle des Nutzers) wird weggelassen.
     chat_history = [AIMessage(content=m['content']) if m['role']=='assistant' else HumanMessage(content=m['content']) for m in st.session_state.messages[:-1]]
 
-    # BONUS: Automatische Erkennung eines Ortes, um den Kontext zu füllen
+    # Sucht mit einem regulären Ausdruck nach einem Ortsnamen in der Nutzereingabe (z.B. "in Berlin").
     location_match = re.search(r'\b(in|bei|nahe)\s+([A-Z][a-zäöüß]+)\b', prompt)
+    # Wenn ein Ort gefunden wurde und noch kein Wohnort im Kontext gespeichert ist:
     if location_match and "wohnort" not in st.session_state.context:
-        stadt = location_match.group(2)
-        st.session_state.context["wohnort"] = stadt
-        st.toast(f"Ich merke mir {stadt} als deinen Wohnort für dieses Gespräch.")
+        stadt = location_match.group(2) # Extrahiert den Namen der Stadt.
+        st.session_state.context["wohnort"] = stadt # Speichert die Stadt im Kontext.
+        st.toast(f"Ich merke mir {stadt} als deinen Wohnort für dieses Gespräch.") # Zeigt eine kurze Bestätigung an.
 
-    # Bereite den Kontext-String für die Kette vor
+    # Baut einen String mit allen bekannten Fakten über den Benutzer zusammen.
     context_parts = []
-    if klasse := st.session_state.context.get("klasse"):
-        context_parts.append(f"Führerscheinklasse: {klasse}")
-    if wohnort := st.session_state.context.get("wohnort"):
-        context_parts.append(f"Wohnort: {wohnort}")
+    if "klasse" in st.session_state.context:
+        context_parts.append(f"Führerscheinklasse: {st.session_state.context['klasse']}")
+    if "wohnort" in st.session_state.context:
+        context_parts.append(f"Wohnort: {st.session_state.context['wohnort']}")
     user_context_string = ", ".join(context_parts) if context_parts else "keine zusätzlichen Fakten"
 
-    # --- State Machine mit sauberer Logik ---
+    # Setzt die Frage, die an die KI gesendet wird, standardmäßig auf die Benutzereingabe.
     frage_fuer_ki = prompt
     
-    # FALL 1: Der Bot wartet auf die Angabe der Führerscheinklasse
+    # --- Logik für mehrstufige Konversationen (Beispiel: Führerscheinkosten) ---
+    # Wenn der Bot auf die Angabe der Führerscheinklasse wartet:
     if st.session_state.conversation_state == "awaiting_klasse_for_price":
-        st.session_state.context["klasse"] = prompt.upper()
-        st.session_state.conversation_state = "chat_active"
+        st.session_state.context["klasse"] = prompt.upper() # Speichert die Klasse im Kontext.
+        st.session_state.conversation_state = "chat_active" # Setzt den Zustand zurück.
+        # Formuliert die ursprüngliche Frage neu mit der jetzt bekannten Klasse.
         frage_fuer_ki = f"Was kostet der Führerschein der Klasse {st.session_state.context['klasse']}?"
         
-    # FALL 2: Der Nutzer fragt nach Kosten, aber die Klasse ist unbekannt -> Rückfrage stellen
-    elif ("preis" in prompt.lower() or "kosten" in prompt.lower() or "kostet" in prompt.lower()) and "führerschein" in prompt.lower() and not st.session_state.context.get("klasse"):
-        st.session_state.conversation_state = "awaiting_klasse_for_price"
+    # Wenn der Nutzer nach Kosten für den Führerschein fragt, aber keine Klasse nennt:
+    elif ("preis" in prompt.lower() or "kosten" in prompt.lower() or "kostet" in prompt.lower()) and "führerschein" in prompt.lower() and "klasse" not in st.session_state.context:
+        st.session_state.conversation_state = "awaiting_klasse_for_price" # Setzt den Zustand auf "warten".
+        # Stellt eine Rückfrage.
         antwort_text = "Gerne! Um dir eine genaue Auskunft geben zu können: Für welche Führerscheinklasse interessierst du dich denn? (z.B. **B** für Auto, **A** für Motorrad oder **AM** für Roller)"
         add_message("assistant", antwort_text)
+        st.rerun() # Lädt die Seite neu, um die Rückfrage sofort anzuzeigen und auf die Antwort zu warten.
+    else:
+        # Ruft die Hauptfunktion auf, um die Antwort von der KI zu erhalten, wenn keine Rückfrage nötig ist.
+        antwort = get_conversational_response(
+            frage=frage_fuer_ki, 
+            chat_history=chat_history, 
+            language_preference=st.session_state.language_preference,
+            user_context=user_context_string
+        )
+        # Fügt die Antwort der KI zum Chatverlauf hinzu.
+        add_message("assistant", antwort)
+            
+        # Lädt die Seite neu, um den kompletten neuen Chatverlauf anzuzeigen.
         st.rerun()
-
-    # FALL 3: Normaler Chat-Ablauf -> KI wird immer aufgerufen
-    antwort = get_conversational_response(
-        frage=frage_fuer_ki, 
-        chat_history=chat_history, 
-        language_preference=st.session_state.language_preference,
-        user_context=user_context_string
-    )
-    add_message("assistant", antwort)
-        
-    st.rerun()
